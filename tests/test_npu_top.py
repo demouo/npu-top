@@ -10,6 +10,7 @@ import unittest
 
 from rich.console import Console
 
+import npu_top
 from npu_top import dashboard, main, parse_info, summary
 
 
@@ -92,6 +93,91 @@ class TelemetryTests(unittest.TestCase):
         sample = parse_info(fixture("dual_die.txt").replace("training-worker", "bad\x1b[31m-worker"))
         self.assertNotIn("\x1b", sample.processes[0].name)
 
+    def test_four_column_950_layout(self):
+        sample = parse_info(fixture("ascend_950.txt"))
+        self.assertEqual(sample.layout, "ascend_950")
+        self.assertEqual(sample.util_label, "NPU UTIL")
+        self.assertEqual([(d.board, d.chip, d.physical) for d in sample.devices],
+                         [(index, 0, index) for index in range(8)])
+        first, second = sample.devices[0], sample.devices[1]
+        self.assertEqual((first.name, first.health), ("Ascend950DT", "OK"))
+        self.assertEqual(first.utilization, 0.0)
+        self.assertAlmostEqual(first.power, 397.7)
+        self.assertEqual(first.temperature, 51.0)
+        self.assertEqual((first.memory_used, first.memory_total, first.memory_kind), (5330.0, 98304.0, "HBM"))
+        self.assertEqual((second.memory_used, second.memory_total), (4772.0, 98304.0))
+        self.assertEqual([(p.board, p.chip, p.pid, p.name, p.memory) for p in sample.processes],
+                         [(0, 0, 1234, "python3", 567.0)])
+
+    def test_950_board_power_is_counted_once(self):
+        output = StringIO()
+        Console(file=output, width=140, color_system=None).print(summary(parse_info(fixture("ascend_950.txt")).devices, False))
+        self.assertIn("3.16 kW", output.getvalue())
+
+    def test_950_dashboard_uses_driver_utilization_label(self):
+        output = StringIO()
+        Console(file=output, width=140, height=40, color_system=None).print(
+            dashboard(parse_info(fixture("ascend_950.txt")), None, {}, 2, 140, 40))
+        self.assertIn("NPU UTIL", output.getvalue())
+        self.assertNotIn("AI CORE", output.getvalue())
+
+    def test_layout_can_be_forced_or_unknown(self):
+        with self.assertRaisesRegex(ValueError, "does not match layout"):
+            parse_info(fixture("dual_die.txt"), layout="ascend_950")
+        with self.assertRaisesRegex(ValueError, "Unknown layout"):
+            parse_info(fixture("dual_die.txt"), layout="no-such-layout")
+
+    def test_950_incomplete_device_is_rejected(self):
+        data = "\n".join(line for line in fixture("ascend_950.txt").splitlines() if "5330" not in line)
+        with self.assertRaises(ValueError):
+            parse_info(data)
+
+
+class PluginTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = list(npu_top.LAYOUTS)
+        self.addCleanup(lambda: npu_top.LAYOUTS.__setitem__(slice(None), self.saved))
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def write_plugin(self, name, body):
+        Path(self.directory.name, name).write_text(textwrap.dedent(body))
+
+    def test_external_layout_plugin_is_used_when_detected(self):
+        self.write_plugin("tiny.py", """
+            from npu_top import Device, Snapshot
+
+            class Tiny:
+                key = "tiny"
+                description = "one device per TINY table"
+                def detect(self, lines):
+                    return any("TINY" in line for line in lines)
+                def parse(self, lines, duration):
+                    devices = [Device(0, 0, 0, "AscendTiny", "OK", 12.0, 33.0, 50.0, 1024.0, 2048.0, "MEMORY")]
+                    return Snapshot(devices, [], 0.0, duration, False)
+            LAYOUT = Tiny()
+        """)
+        npu_top.load_layout_plugins([self.directory.name])
+        snapshot = parse_info("| TINY table |")
+        self.assertEqual(snapshot.devices[0].name, "AscendTiny")
+        self.assertEqual(snapshot.devices[0].utilization, 50.0)
+
+    def test_duplicate_layout_key_is_rejected(self):
+        self.write_plugin("duplicate.py", """
+            class Duplicate:
+                key = "ascend_910"
+                detect = staticmethod(lambda lines: False)
+                parse = staticmethod(lambda lines, duration: None)
+            LAYOUT = Duplicate()
+        """)
+        with self.assertRaisesRegex(ValueError, "reuses layout key"):
+            npu_top.load_layout_plugins([self.directory.name])
+
+    def test_missing_plugin_is_rejected(self):
+        self.write_plugin("empty.py", "VALUE = 1\n")
+        with self.assertRaisesRegex(ValueError, "must define LAYOUT"):
+            npu_top.load_layout_plugins([self.directory.name])
+
 
 class CommandTests(unittest.TestCase):
     def setUp(self):
@@ -122,6 +208,26 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Boards: 1; dies: 1", result.stdout)
         self.assertIn("Memory types: MEMORY", result.stdout)
+
+    def test_doctor_loads_layout_plugin_directory(self):
+        plugins = Path(self.directory.name) / "plugins"
+        plugins.mkdir()
+        (plugins / "tiny.py").write_text(textwrap.dedent("""
+            from npu_top import Device, Snapshot
+
+            class Tiny:
+                key = "tiny"
+                description = "one device per TINY table"
+                detect = staticmethod(lambda lines: any("TINY" in line for line in lines))
+                def parse(self, lines, duration):
+                    return Snapshot([Device(0, 0, 0, "AscendTiny", "OK", 1.0, 2.0, 3.0, 4.0, 8.0, "MEMORY")],
+                                    [], 0.0, duration, False)
+            LAYOUT = Tiny()
+        """))
+        self.write_driver("print('| TINY table |')\n")
+        result = self.run_cli("--plugins", str(plugins), "--doctor", "--no-color")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Layout: tiny", result.stdout)
 
     def test_redirected_output_is_one_snapshot(self):
         self.write_driver(f"print({fixture('dual_die.txt')!r})\n")

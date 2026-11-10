@@ -28,12 +28,38 @@ Python 依赖只有 Rich，不需要 PyTorch、torch_npu 或训练框架。按 `
 | 环境 | 验证情况 |
 | --- | --- |
 | Ascend 910C，8 卡 16 die，aarch64 Linux，npu-smi 25.5.2 | 已在真实硬件运行 |
+| Ascend 950DT，8 个 NPU，aarch64 Linux，npu-smi 25.1.rc2 | 已在真实硬件运行 |
 | 相同表格格式的其他 910、910B、910C 机器 | 预期可用，未逐机型实测 |
 | 单芯片、仅有 `Memory-Usage(MB)` 的布局，包括 310 系列使用的同类布局 | 合成样例测试通过，没有 310 硬件实测 |
 | Linux x86_64 | 无架构专用代码，没有该架构的硬件实测 |
-| Windows、macOS 或其他输出格式 | 不支持 |
+| Windows、macOS 或其他输出格式 | 不支持；可编写布局插件适配 |
 
-解析器要求三列设备表，包含 `NPU Name`、`Chip Phy-ID` 和 `AICore(%)` 行。内存优先读取 `HBM-Usage(MB)`，否则读取 `Memory-Usage(MB)` 或 `DDR-Usage(MB)`。缺失指标显示为不可用，不记成 0；驱动没有返回进程表时，明确显示进程信息不可用。功耗按板卡去重。
+内置两种布局适配器：`ascend_910` 解析含 `NPU Name`、`Chip Phy-ID`、`AICore(%)` 的三列表格；`ascend_950` 解析含 `NPU ID`、`Name`、`Health`、`NPU Util(%)` 的四列表格。内存优先读取 `HBM-Usage(MB)`，否则读取 `Memory-Usage(MB)` 或 `DDR-Usage(MB)`。缺失指标显示为不可用，不记成 0；驱动没有返回进程表时，明确显示进程信息不可用。功耗按板卡去重。
+
+## 布局插件
+
+驱动输出格式不同，又不想改程序时，可以把一个 Python 文件放进目录，用 `--plugins 目录`（可重复）或 `NPU_TOP_PLUGINS=目录1:目录2` 加载。文件定义 `LAYOUT`，包含唯一的字符串 `key`、可选的 `description`、`detect(lines)` 和 `parse(lines, duration)`：
+
+```python
+import time
+from npu_top import Device, Snapshot
+
+class MyLayout:
+    key = "my-driver"
+    description = "每个 NPU 一行"
+
+    def detect(self, lines):
+        return any("MY UTIL(%)" in line for line in lines)
+
+    def parse(self, lines, duration):
+        return Snapshot(
+            [Device(0, 0, 0, "AscendX", "OK", 100.0, 40.0, 50.0, 1024.0, 8192.0, "HBM")],
+            [], time.time(), duration, False)
+
+LAYOUT = MyLayout()
+```
+
+`lines` 只包含以 `|` 开头的表格行。`detect` 只对自己负责的格式返回 `True`；`parse` 返回 `Snapshot`，其中 `layout` 可以留空，由程序补上适配器名。插件文件以当前用户权限执行 Python 代码。`--doctor` 会列出可用布局，检测有歧义时可用 `--layout KEY` 强制指定。
 
 容器内需要能访问驱动命令、驱动库及获准使用的设备。显示范围以 `npu-smi` 实际可见设备为准，不按 `ASCEND_RT_VISIBLE_DEVICES` 过滤。
 
@@ -45,6 +71,8 @@ npu-top -i 1
 npu-top --once --no-color
 npu-top --json
 npu-top --npu-smi /usr/local/Ascend/driver/tools/npu-smi
+npu-top --layout ascend_950
+npu-top --plugins /path/to/layouts
 ```
 
 默认每 2 秒查询一次，最短间隔 0.5 秒。也可通过 `NPU_SMI` 指定命令路径。未指定时先查找 `PATH`，再查找驱动标准目录。
