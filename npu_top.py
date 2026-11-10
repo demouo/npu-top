@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+import importlib.util
 import json
 import math
 import os
+from pathlib import Path
 import queue
 import re
 import select
@@ -23,6 +25,7 @@ import termios
 import threading
 import time
 import tty
+from typing import Callable
 
 from rich import box
 from rich.console import Console, Group
@@ -78,6 +81,8 @@ class Snapshot:
     sampled_at: float
     duration: float
     processes_available: bool
+    layout: str = ""
+    util_label: str = "AI CORE"
 
 
 def number(value: str) -> float | None:
@@ -88,30 +93,65 @@ def number(value: str) -> float | None:
     return result if math.isfinite(result) and result >= 0 else None
 
 
-def parse_info(output: str, duration: float = 0) -> Snapshot:
+VALUE_PATTERN = r"(?:[+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A|NA|nan|[+-]?inf|-)"
+INCOMPLETE = "Could not read complete NPU metrics; inspect 'npu-smi info' and driver access"
+
+
+def table_lines(output: str) -> list[str]:
+    return [line.strip() for line in output.splitlines() if line.strip().startswith("|")]
+
+
+def split_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def clean_name(value: str) -> str:
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", value)
+
+
+def memory_columns_from(header: str) -> list[str]:
+    return [name.upper() for name in re.findall(r"(HBM|Memory|DDR)-Usage\((?:MB|MiB)\)", header, re.IGNORECASE)]
+
+
+def memory_measurement(text: str, memory_columns: list[str]) -> tuple[float | None, float | None, str]:
+    pairs = re.findall(rf"({VALUE_PATTERN})\s*/\s*({VALUE_PATTERN})", text, re.IGNORECASE)
+    if not memory_columns or len(pairs) != len(memory_columns):
+        raise ValueError("Unsupported npu-smi memory layout; inspect 'npu-smi info'")
+    index = memory_columns.index("HBM") if "HBM" in memory_columns else 0
+    used, total = map(number, pairs[index])
+    return used, total, memory_columns[index]
+
+
+def process_row(cells: list[str]) -> Process | None:
+    """Read one process row from either the 4-column or the 5-column process table."""
+    if len(cells) == 4 and re.fullmatch(r"\d+\s+\d+", cells[0]) and cells[1].isdigit():
+        board, chip = (int(part) for part in cells[0].split())
+        return Process(board, chip, int(cells[1]), clean_name(cells[2]), number(cells[3]))
+    if len(cells) == 5 and cells[0].isdigit() and cells[1].isdigit():
+        return Process(int(cells[0]), 0, int(cells[1]), clean_name(cells[2]), number(cells[3]))
+    return None
+
+
+def parse_npu_name_layout(lines: list[str], duration: float) -> Snapshot:
+    """NPU Name + Chip Phy-ID rows with AICore(%): 910, 910B, 910C, and 310-series output."""
     devices, processes = [], []
     pending = None
     process_section = False
     memory_columns = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line.startswith("|"):
-            continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    for line in lines:
+        cells = split_cells(line)
         if re.search(r"Process\s+id", line, re.IGNORECASE):
             process_section = True
             continue
         if process_section:
-            if len(cells) == 4 and re.fullmatch(r"\d+\s+\d+", cells[0]) and cells[1].isdigit():
-                board, chip = map(int, cells[0].split())
-                name = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", cells[2])
-                processes.append(Process(board, chip, int(cells[1]), name, number(cells[3])))
+            process = process_row(cells)
+            if process is not None:
+                processes.append(process)
+            continue
+        if len(cells) == 3 and "AICore(%)" in cells[2]:
+            memory_columns = memory_columns_from(cells[2])
             continue
         if len(cells) != 3:
-            continue
-        if "AICore(%)" in cells[2]:
-            memory_columns = re.findall(r"(HBM|Memory|DDR)-Usage\((?:MB|MiB)\)", cells[2], re.IGNORECASE)
-            memory_columns = [name.upper() for name in memory_columns]
             continue
         identity = cells[0].split()
         metrics = cells[2].split()
@@ -120,24 +160,116 @@ def parse_info(output: str, duration: float = 0) -> Snapshot:
                 raise ValueError("npu-smi returned incomplete device information")
             pending = (int(identity[0]), " ".join(identity[1:]), cells[1], number(metrics[0]), number(metrics[1]))
         elif pending is not None and len(identity) == 2 and all(part.isdigit() for part in identity):
-            value_pattern = r"(?:[+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A|NA|nan|[+-]?inf|-)"
-            pairs = re.findall(rf"({value_pattern})\s*/\s*({value_pattern})", cells[2], re.IGNORECASE)
-            if not memory_columns or len(pairs) != len(memory_columns):
-                raise ValueError("Unsupported npu-smi memory layout; inspect 'npu-smi info'")
-            memory_index = memory_columns.index("HBM") if "HBM" in memory_columns else 0
-            used, total = map(number, pairs[memory_index])
+            used, total, kind = memory_measurement(cells[2], memory_columns)
             board, name, health, power, temperature = pending
             devices.append(Device(board, int(identity[0]), int(identity[1]), name, health,
                                   power, temperature, number(metrics[0]) if metrics else None,
-                                  used, total, memory_columns[memory_index]))
+                                  used, total, kind))
             pending = None
     if pending is not None or not devices:
-        raise ValueError("Could not read complete NPU metrics; inspect 'npu-smi info' and driver access")
+        raise ValueError(INCOMPLETE)
     devices.sort(key=lambda device: (device.board, device.chip))
-    return Snapshot(devices, processes, time.time(), duration, process_section)
+    return Snapshot(devices, processes, time.time(), duration, process_section, "ascend_910", "AI CORE")
 
 
-def collect(command: str, stop: threading.Event) -> Snapshot | None:
+def parse_npu_id_layout(lines: list[str], duration: float) -> Snapshot:
+    """NPU ID | Name | Health | NPU Util(%) rows: npu-smi 25.1 output such as Ascend 950DT."""
+    devices, processes = [], []
+    pending = None
+    process_section = False
+    memory_columns = []
+    for line in lines:
+        cells = split_cells(line)
+        if re.search(r"Process\s+id", line, re.IGNORECASE):
+            process_section = True
+            continue
+        if process_section:
+            process = process_row(cells)
+            if process is not None:
+                processes.append(process)
+            continue
+        if len(cells) == 4 and "NPU Util(%)" in cells[3]:
+            memory_columns = memory_columns_from(cells[3])
+            continue
+        if len(cells) != 4:
+            continue
+        metrics = cells[3].split()
+        if cells[0].isdigit() and cells[1] and not cells[1].isdigit():
+            if pending is not None or len(metrics) < 2:
+                raise ValueError("npu-smi returned incomplete device information")
+            pending = (int(cells[0]), cells[1], cells[2], number(metrics[0]), number(metrics[1]))
+        elif pending is not None and not cells[0] and not cells[1]:
+            used, total, kind = memory_measurement(cells[3], memory_columns)
+            board, name, health, power, temperature = pending
+            devices.append(Device(board, 0, board, name, health, power, temperature,
+                                  number(metrics[0]) if metrics else None, used, total, kind))
+            pending = None
+    if pending is not None or not devices:
+        raise ValueError(INCOMPLETE)
+    devices.sort(key=lambda device: (device.board, device.chip))
+    return Snapshot(devices, processes, time.time(), duration, process_section, "ascend_950", "NPU UTIL")
+
+
+@dataclass(frozen=True)
+class LayoutSpec:
+    key: str
+    description: str
+    detect: Callable[[list[str]], bool]
+    parse: Callable[[list[str], float], Snapshot]
+
+
+LAYOUTS: list[LayoutSpec] = []
+
+
+def register_layout(layout: LayoutSpec) -> LayoutSpec:
+    LAYOUTS.append(layout)
+    return layout
+
+
+def load_layout_plugins(directories: list[str]) -> None:
+    """Load external layout adapters. Each ``*.py`` file must define ``LAYOUT``."""
+    for directory in directories:
+        path = Path(directory)
+        if not path.is_dir():
+            raise ValueError(f"Plugin directory not found: {directory}")
+        for file in sorted(path.glob("*.py")):
+            spec = importlib.util.spec_from_file_location(f"npu_top_layout_{file.stem}", file)
+            if spec is None or spec.loader is None:
+                raise ValueError(f"Could not load layout plugin: {file}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            layout = getattr(module, "LAYOUT", None)
+            key = getattr(layout, "key", None)
+            detect = getattr(layout, "detect", None)
+            parse = getattr(layout, "parse", None)
+            if not isinstance(key, str) or not key or not callable(detect) or not callable(parse):
+                raise ValueError(f"Layout plugin {file} must define LAYOUT with a string key, detect, and parse")
+            if any(existing.key == key for existing in LAYOUTS):
+                raise ValueError(f"Layout plugin {file} reuses layout key {key!r}")
+            register_layout(LayoutSpec(key, str(getattr(layout, "description", "")), detect, parse))
+
+
+register_layout(LayoutSpec("ascend_910", "NPU Name and Chip Phy-ID rows with AICore(%)",
+                           lambda lines: any("AICore(%)" in line for line in lines), parse_npu_name_layout))
+register_layout(LayoutSpec("ascend_950", "NPU ID, Name, and Health rows with NPU Util(%)",
+                           lambda lines: any("NPU Util(%)" in line for line in lines), parse_npu_id_layout))
+
+
+def parse_info(output: str, duration: float = 0, layout: str | None = None) -> Snapshot:
+    lines = table_lines(output)
+    candidates = [candidate for candidate in LAYOUTS if layout is None or candidate.key == layout]
+    if not candidates:
+        raise ValueError(f"Unknown layout {layout!r}; available: {', '.join(item.key for item in LAYOUTS)}")
+    for candidate in candidates:
+        if candidate.detect(lines):
+            snapshot = candidate.parse(lines, duration)
+            return snapshot if snapshot.layout else replace(snapshot, layout=candidate.key)
+    if layout is not None:
+        raise ValueError(f"npu-smi output does not match layout {layout!r}")
+    raise ValueError(INCOMPLETE)
+
+
+def collect(command: str, stop: threading.Event, layout: str | None = None) -> Snapshot | None:
     started = time.monotonic()
     with subprocess.Popen([command, "info"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, errors="replace", env={**os.environ, "LC_ALL": "C"}) as process:
@@ -154,18 +286,19 @@ def collect(command: str, stop: threading.Event) -> Snapshot | None:
             if process.returncode:
                 detail = " ".join((error or output).split())[:180]
                 raise RuntimeError(f"npu-smi exited with code {process.returncode}: {detail or 'no error details'}")
-            return parse_info(output, time.monotonic() - started)
+            return parse_info(output, time.monotonic() - started, layout)
         finally:
             if process.poll() is None:
                 process.kill()
             process.communicate()
 
 
-def poll(command: str, interval: float, stop: threading.Event, updates: queue.SimpleQueue) -> None:
+def poll(command: str, interval: float, stop: threading.Event, updates: queue.SimpleQueue,
+         layout: str | None = None) -> None:
     while not stop.is_set():
         started = time.monotonic()
         try:
-            snapshot = collect(command, stop)
+            snapshot = collect(command, stop, layout)
             if snapshot is not None:
                 updates.put((snapshot, None))
         except (OSError, ValueError, RuntimeError) as error:
@@ -199,7 +332,7 @@ def sparkline(points: deque, now: float, width: int) -> Text:
     return result
 
 
-def summary(devices: list[Device], compact: bool):
+def summary(devices: list[Device], compact: bool, util_label: str = "AI CORE"):
     usage = [d.utilization for d in devices if d.utilization is not None]
     memory = [d for d in devices if d.memory_used is not None and d.memory_total is not None]
     temperatures = [d.temperature for d in devices if d.temperature is not None]
@@ -215,7 +348,7 @@ def summary(devices: list[Device], compact: bool):
     peak = f"{max(temperatures):.0f}°C" if temperatures else "N/A"
     watts = f"{sum(power_by_board.values()) / 1000:.2f} kW" if power_by_board else "N/A"
     cards = [
-        ("AI CORE", average, f"{sum(value > 0 for value in usage)} active / {len(usage)} dies", CYAN),
+        (util_label, average, f"{sum(value > 0 for value in usage)} active / {len(usage)} dies", CYAN),
         (f"{memory_kind} USED", memory_value, memory_total, PURPLE),
         ("PEAK TEMP", peak, f"{len(temperatures)} dies reported", AMBER),
         ("BOARD POWER", watts, f"{len(power_by_board)} boards reported", GREEN),
@@ -236,20 +369,21 @@ def summary(devices: list[Device], compact: bool):
     return table
 
 
-def device_table(devices: list[Device], history: dict, now: float, width: int) -> Table:
+def device_table(devices: list[Device], history: dict, now: float, width: int,
+                 util_label: str = "AI CORE") -> Table:
     table = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1), show_edge=False,
                   border_style=EDGE, header_style=MUTED)
     table.add_column("DIE", no_wrap=True, width=5)
     if width >= 90:
         table.add_column("CARD.CHIP", no_wrap=True, width=9)
-    table.add_column("AI CORE", no_wrap=True, ratio=1)
+    table.add_column(util_label, no_wrap=True, ratio=1)
     memory_label = "HBM GiB" if all(d.memory_kind == "HBM" for d in devices) else "MEM GiB"
     table.add_column(memory_label, no_wrap=True, ratio=1)
     table.add_column("TEMP", no_wrap=True, justify="right", width=5)
     if width >= 100:
         table.add_column("BOARD W", no_wrap=True, justify="right", width=7)
     if width >= 115:
-        table.add_column("AI CORE · 60s", no_wrap=True, width=18)
+        table.add_column(f"{util_label} · 60s", no_wrap=True, width=18)
     for device in devices:
         color = GREEN if device.health.upper() == "OK" else (AMBER if device.health in {"-", "N/A"} else RED)
         row = [Text.assemble(("● ", color), (f"{device.physical:02}", f"bold {FG}"))]
@@ -322,7 +456,8 @@ def dashboard(snapshot: Snapshot | None, error: str | None, history: dict,
         return Layout(Panel(Text("Resize the terminal to at least 60 columns by 16 rows.\nPress q to quit.", style=AMBER),
                             style=f"{FG} on {BG}", border_style=EDGE), size=height)
     selected = devices[page * rows_per_page:(page + 1) * rows_per_page]
-    content = device_table(selected, history, now, width) if snapshot else Text("\n  Reading NPU telemetry…", style=MUTED)
+    util_label = snapshot.util_label if snapshot else "AI CORE"
+    content = device_table(selected, history, now, width, util_label) if snapshot else Text("\n  Reading NPU telemetry…", style=MUTED)
     bad_health = [d for d in devices if d.health.upper() != "OK"]
     health = f"{len(bad_health)} CHECK HEALTH" if bad_health else ("ALL HEALTHY" if devices else "CONNECTING")
     panel = Panel(content, title=Text("DEVICES", style=MUTED), title_align="left",
@@ -342,7 +477,7 @@ def dashboard(snapshot: Snapshot | None, error: str | None, history: dict,
                              ("← → / n p ", f"bold {CYAN}"), ("page   ", MUTED),
                              ("Ctrl+C ", f"bold {CYAN}"), ("exit", MUTED))
     layout = Layout(size=height)
-    sections = [Layout(header, size=3), Layout(summary(devices, compact), size=stats_height), Layout(panel)]
+    sections = [Layout(header, size=3), Layout(summary(devices, compact, util_label), size=stats_height), Layout(panel)]
     if process_height:
         sections.append(Layout(process_panel(snapshot.processes if snapshot else [], process_height,
                                              snapshot.processes_available if snapshot else False), size=process_height))
@@ -378,6 +513,8 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--json", action="store_true", help="Print one snapshot as JSON and exit")
     modes.add_argument("--doctor", action="store_true", help="Check driver access and output compatibility")
     parser.add_argument("--npu-smi", default=os.environ.get("NPU_SMI"), metavar="PATH", help="Path to npu-smi; defaults to NPU_SMI, PATH, then the standard driver directory")
+    parser.add_argument("--layout", default=None, metavar="KEY", help="Force one layout instead of detecting it; --doctor lists the layouts")
+    parser.add_argument("--plugins", action="append", default=[], metavar="DIR", help="Directory of layout plugin files; can repeat. NPU_TOP_PLUGINS adds more")
     parser.add_argument("--no-color", action="store_true", help="Disable colors")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
@@ -388,10 +525,20 @@ def main(argv: list[str] | None = None) -> int:
     if command is None:
         console.print("npu-smi was not found. Install the Ascend driver or set --npu-smi /path/to/npu-smi.", style=RED)
         return 1
+    plugin_directories = list(args.plugins)
+    plugin_directories += [entry for entry in os.environ.get("NPU_TOP_PLUGINS", "").split(os.pathsep) if entry]
+    try:
+        load_layout_plugins(plugin_directories)
+    except (OSError, ValueError, ImportError, SyntaxError) as error:
+        console.print(Text(str(error), style=RED))
+        return 1
+    if args.layout is not None and all(item.key != args.layout for item in LAYOUTS):
+        console.print(Text(f"Unknown layout {args.layout!r}; available: {', '.join(item.key for item in LAYOUTS)}", style=RED))
+        return 1
     stop = threading.Event()
     if args.once or args.json or args.doctor or not (sys.stdout.isatty() and sys.stdin.isatty()):
         try:
-            snapshot = collect(command, stop)
+            snapshot = collect(command, stop, args.layout)
         except (OSError, ValueError, RuntimeError) as error:
             console.print(Text(str(error), style=RED))
             return 1
@@ -402,14 +549,16 @@ def main(argv: list[str] | None = None) -> int:
             console.print(Text(f"OK: npu-smi at {command}\nBoards: {len({d.board for d in snapshot.devices})}; "
                                f"dies: {len(snapshot.devices)}; query: {snapshot.duration:.2f}s.\n"
                                f"Memory types: {', '.join(sorted({d.memory_kind for d in snapshot.devices}))}.\n"
-                               f"Process table: {'available' if snapshot.processes_available else 'not reported'}."))
+                               f"Process table: {'available' if snapshot.processes_available else 'not reported'}.\n"
+                               f"Layout: {snapshot.layout} ({snapshot.util_label}).\n"
+                               f"Available layouts: {', '.join(item.key for item in LAYOUTS)}."))
             return 0
         history = {d.physical: deque([(snapshot.sampled_at, d.utilization)]) for d in snapshot.devices}
         height = max(38, len(snapshot.devices) + 22) if console.width >= 90 else max(16, len(snapshot.devices) + 11)
         console.print(dashboard(snapshot, None, history, args.interval, console.width, height), height=height)
         return 0
     updates = queue.SimpleQueue()
-    worker = threading.Thread(target=poll, args=(command, args.interval, stop, updates), daemon=True)
+    worker = threading.Thread(target=poll, args=(command, args.interval, stop, updates, args.layout), daemon=True)
     snapshot, error, history, page = None, None, {}, 0
     worker.start()
     try:

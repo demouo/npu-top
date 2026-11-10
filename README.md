@@ -28,12 +28,38 @@ Press `q` or `Ctrl+C` to quit. Use the left and right arrow keys, `n`, or `p` to
 | Environment | Verification |
 | --- | --- |
 | Ascend 910C, 8 boards and 16 dies, aarch64 Linux, npu-smi 25.5.2 | Tested on hardware |
+| Ascend 950DT, 8 NPUs, aarch64 Linux, npu-smi 25.1.rc2 | Tested on hardware |
 | Other Ascend 910, 910B, or 910C machines with the same table layout | Expected to work; not tested on those machines |
 | Single-chip layouts with a `Memory-Usage(MB)` field, including layouts used by 310-series devices | Tested with synthetic fixtures; no 310 hardware test |
 | Linux x86_64 | No architecture-specific code; no hardware test |
-| Windows, macOS, or drivers with different output layouts | Unsupported |
+| Windows, macOS, or drivers with a different layout | Unsupported unless a layout plugin is added |
 
-Compatibility depends on the driver's output format. The parser expects the three-column device table with `NPU Name`, `Chip Phy-ID`, and `AICore(%)` rows. It selects `HBM-Usage(MB)` when present, otherwise `Memory-Usage(MB)` or `DDR-Usage(MB)`. Missing values remain unavailable. A missing process table is reported as unavailable.
+Compatibility depends on the driver's output format. npu-top ships two layout adapters: `ascend_910` for the three-column table with `NPU Name`, `Chip Phy-ID`, and `AICore(%)` rows, and `ascend_950` for the four-column table with `NPU ID`, `Name`, `Health`, and `NPU Util(%)` rows. It selects `HBM-Usage(MB)` when present, otherwise `Memory-Usage(MB)` or `DDR-Usage(MB)`. Missing values remain unavailable. A missing process table is reported as unavailable. Other layouts can be supplied as plugins.
+
+## Layout plugins
+
+To support a new `npu-smi info` format without modifying npu-top, put a Python file in a directory and pass `--plugins DIRECTORY` (repeatable) or set `NPU_TOP_PLUGINS=DIR1:DIR2`. Each `.py` file defines `LAYOUT` with a unique string `key`, an optional `description`, `detect(lines)`, and `parse(lines, duration)`:
+
+```python
+import time
+from npu_top import Device, Snapshot
+
+class MyLayout:
+    key = "my-driver"
+    description = "one row per NPU"
+
+    def detect(self, lines):
+        return any("MY UTIL(%)" in line for line in lines)
+
+    def parse(self, lines, duration):
+        return Snapshot(
+            [Device(0, 0, 0, "AscendX", "OK", 100.0, 40.0, 50.0, 1024.0, 8192.0, "HBM")],
+            [], time.time(), duration, False)
+
+LAYOUT = MyLayout()
+```
+
+`lines` holds only the table lines that start with `|`. `detect` must return `True` only for the output it handles. `parse` returns a `Snapshot`; its `layout` field may be left empty, and npu-top fills in the adapter key. Plugin files execute as Python with the user's permissions. `--doctor` lists the available layouts, and `--layout KEY` forces one when detection is ambiguous.
 
 The program discovers board, chip, and physical IDs from the table. It does not assume eight cards, two chips per card, consecutive IDs, or a particular memory capacity. Board power is counted once per board.
 
@@ -49,6 +75,8 @@ In containers, the driver executable, driver libraries, and permitted NPU device
 | `npu-top --json` | Print one snapshot as JSON; missing measurements are `null` |
 | `npu-top --doctor` | Check executable discovery, driver access, and table parsing |
 | `npu-top --npu-smi /path/to/npu-smi` | Use a specific driver executable |
+| `npu-top --layout ascend_950` | Force a layout; without it the layout is detected |
+| `npu-top --plugins /path/to/layouts` | Load external layout plugins; `NPU_TOP_PLUGINS` adds more |
 | `npu-top --version` | Print the version |
 
 You can also set `NPU_SMI=/path/to/npu-smi`. Without an override, the program searches `PATH`, then `/usr/local/Ascend/driver/tools/npu-smi`.
