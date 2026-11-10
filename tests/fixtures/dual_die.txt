@@ -1,0 +1,12 @@
++--------------------------------------------------------------------------------+
+| npu-smi example                                                                |
+| NPU   Name              | Health       | Power(W) Temp(C) Hugepages-Usage(page)  |
+| Chip  Phy-ID            | Bus-Id       | AICore(%) Memory-Usage(MB) HBM-Usage(MB)|
+| 3     Ascend910         | OK           | 300.0 50 0 / 0                         |
+| 0     6                 | 0000:80:00.0  | 75 0 / 0 4096 / 65536                 |
+| 3     Ascend910         | OK           | 300.0 52 0 / 0                         |
+| 1     9                 | 0000:81:00.0  | 25 0 / 0 8192 / 65536                 |
+| NPU   Chip              | Process id   | Process name       | Process memory(MB)|
+| 3     0                 | 1234         | training-worker    | 4096              |
+| 3     1                 | 1234         | training-worker    | 8192              |
++--------------------------------------------------------------------------------+

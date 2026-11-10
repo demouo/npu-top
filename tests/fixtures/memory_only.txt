@@ -1,0 +1,8 @@
++--------------------------------------------------------------------------------+
+| NPU   Name              | Health       | Power(W) Temp(C) Hugepages-Usage(page)  |
+| Chip  Phy-ID            | Bus-Id       | AICore(%) Memory-Usage(MB)              |
+| 5     Ascend310P3       | OK           | - 42 0 / 0                             |
+| 0     7                 | 0000:40:00.0  | 36 1024 / 24576                        |
+| NPU   Chip              | Process id   | Process name       | Process memory(MB)|
+| No running processes found in NPU 5                                            |
++--------------------------------------------------------------------------------+
